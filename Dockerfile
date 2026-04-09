@@ -4,12 +4,12 @@ FROM gcc:latest
 # Set the working directory inside the container
 WORKDIR /app
 
-# Copy the source code into the container
-COPY pm_sim.c .
+# Copy all files into the container
+# This includes pm_sim.c and any .txt script files
+COPY . .
 
 # Compile the simulator
-RUN gcc -Wall -o pm_sim pm_sim.c -lpthread
+RUN gcc -Wall -o /usr/local/bin/pm_sim pm_sim.c -lpthread
 
 # Set the entrypoint to the compiled binary
-# This allows passing arguments (thread files) easily
-ENTRYPOINT ["/app/pm_sim"]
+ENTRYPOINT ["pm_sim"]

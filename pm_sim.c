@@ -241,7 +241,10 @@ void *monitor_thread(void *arg) {
 
 void run_script(const char *file, int tid) {
     FILE *f = fopen(file, "r");
-    if (!f) return;
+    if (!f) {
+        perror("fopen (script file)");
+        return;
+    }
 
     char line[256];
     int a, b;
