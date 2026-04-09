@@ -1,0 +1,7 @@
+services:
+  pm_sim:
+    build: .
+    volumes:
+      - .:/app
+    # Default command if none provided, can be overridden
+    command: thread1.txt thread2.txt

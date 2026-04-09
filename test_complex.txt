@@ -1,0 +1,8 @@
+fork 1
+fork 1
+sleep 100
+exit 2 10
+exit 3 20
+wait 1 -1
+wait 1 -1
+ps
