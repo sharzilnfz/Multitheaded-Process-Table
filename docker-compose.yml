@@ -1,7 +1,12 @@
 services:
   pm_sim:
     build: .
+    working_dir: /output
     volumes:
-      - .:/app
-    # Default command if none provided, can be overridden
-    command: thread1.txt thread2.txt
+      # Mount thread files into /app (where the binary is)
+      - ./thread1.txt:/app/thread1.txt:ro
+      - ./thread2.txt:/app/thread2.txt:ro
+      # Bind the output folder so snapshots.txt appears on your host
+      - ./output:/output
+    # Pass absolute paths to the thread files
+    command: /app/thread1.txt /app/thread2.txt
