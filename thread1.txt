@@ -2,3 +2,4 @@ fork 1
 sleep 200
 fork 1
 wait 1 -1
+ps

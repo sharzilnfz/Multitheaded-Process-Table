@@ -6,4 +6,4 @@ services:
       # Mount the entire project root so all script files are available
       - .:/app
     # Default thread files
-    command: test_complex.txt
+    command: thread1.txt thread2.txt
