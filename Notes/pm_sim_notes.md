@@ -1,338 +1,358 @@
-# Multithreaded Process Manager — Complete Study Notes
-### Everything you need to understand the code line by line and ace your viva
+# CSE 321 — Multithreaded Process Manager Simulator
+## Complete Viva Notes: From Zero to Master
 
 ---
 
 ## Table of Contents
 
-1. [What This Project Actually Is](#1-what-this-project-actually-is)
-2. [The Big Picture — How All Pieces Fit](#2-the-big-picture--how-all-pieces-fit)
-3. [C Fundamentals You Must Know](#3-c-fundamentals-you-must-know)
-4. [Section by Section — Every Line Explained](#4-section-by-section--every-line-explained)
-   - 4.1 [#includes and #defines](#41-includes-and-defines)
-   - 4.2 [The ProcessState Enum](#42-the-processstate-enum)
-   - 4.3 [The PCB Struct](#43-the-pcb-struct)
-   - 4.4 [Global Variables](#44-global-variables)
-   - 4.5 [Helper Functions](#45-helper-functions)
-   - 4.6 [pm_fork](#46-pm_fork)
-   - 4.7 [pm_exit](#47-pm_exit)
-   - 4.8 [pm_kill](#48-pm_kill)
-   - 4.9 [pm_wait](#49-pm_wait)
-   - 4.10 [pm_ps](#410-pm_ps)
-   - 4.11 [The Monitor Thread](#411-the-monitor-thread)
-   - 4.12 [The Script Interpreter](#412-the-script-interpreter)
-   - 4.13 [The Worker Thread](#413-the-worker-thread)
-   - 4.14 [main()](#414-main)
-5. [Synchronization — The Heart of the Project](#5-synchronization--the-heart-of-the-project)
-6. [Process Lifecycle — State Transitions](#6-process-lifecycle--state-transitions)
-7. [Tracing a Full Execution Example](#7-tracing-a-full-execution-example)
-8. [Common Viva Questions and Answers](#8-common-viva-questions-and-answers)
+1. [The Big Picture — What Are We Building?](#1-the-big-picture)
+2. [Operating System Concepts You Must Know](#2-os-concepts)
+3. [Concurrency Primitives — Mutex & Semaphore](#3-concurrency-primitives)
+4. [Header Files — Every Include Explained](#4-header-files)
+5. [Global Constants and Data](#5-global-constants-and-data)
+6. [The PCB Struct — Heart of the System](#6-the-pcb-struct)
+7. [Process States and Transitions](#7-process-states-and-transitions)
+8. [Helper Functions](#8-helper-functions)
+9. [write_snapshot — The Logging Engine](#9-write_snapshot)
+10. [pm_fork — Creating a Process](#10-pm_fork)
+11. [pm_exit — Terminating a Process](#11-pm_exit)
+12. [pm_kill — Force-Killing a Process](#12-pm_kill)
+13. [pm_wait — Waiting for a Child](#13-pm_wait)
+14. [pm_ps — Printing the Process Table](#14-pm_ps)
+15. [monitor_thread — The Observer](#15-monitor_thread)
+16. [run_script — The Script Interpreter](#16-run_script)
+17. [worker — The Thread Entry Point](#17-worker)
+18. [main — Putting It All Together](#18-main)
+19. [Why No pthread_cond_t?](#19-why-no-pthread_cond_t)
+20. [Concurrency Scenarios — Walk-Throughs](#20-concurrency-scenarios)
+21. [Likely Viva Questions and Model Answers](#21-viva-questions)
+22. [Common Bugs and Why We Avoided Them](#22-common-bugs)
 
 ---
 
-## 1. What This Project Actually Is
+## 1. The Big Picture
 
-Before diving into code, understand what you built at a high level.
+### What is this project?
 
-An operating system keeps track of every running program using a data structure called a **Process Control Block (PCB)**. In a real OS, each PCB corresponds to an actual running process. In this project, you simulate that management layer in software — the processes are fake (just entries in an array), but the management logic is real.
+In a real operating system (like Linux), when you run a program, the OS creates a **process** — a running instance of that program. The OS keeps track of every running process in a data structure called the **process table**. Each entry in the process table is a **Process Control Block (PCB)**.
 
-**You built:**
-- A shared table of 64 fake processes
-- Multiple threads that concurrently create, terminate, and wait on those fake processes
-- A synchronization system that prevents those threads from corrupting the shared table
-- A monitor thread that logs every change to a file
+This project **simulates** that entire mechanism in C. We are not creating real OS processes. We are:
 
-**The key insight:** The project is not about processes. It is about **threads safely sharing data**. The processes are just the data being shared. The real learning is in the mutex and condition variable usage.
+- Maintaining a fake process table in memory (an array of PCBs)
+- Using **POSIX threads (pthreads)** to simulate multiple things happening at the same time
+- Using **mutexes and semaphores** to make sure threads don't corrupt the shared table
+- Writing **snapshot logs** every time the table changes
+
+Think of it this way:
+
+```
+Real OS          ←→      This Project
+-----------               -----------------
+Actual processes          PCB entries in an array
+Kernel scheduler          Our mutex + semaphores
+fork() system call        pm_fork()
+exit() system call        pm_exit()
+wait() system call        pm_wait()
+kill() system call        pm_kill()
+ps command                pm_ps()
+```
+
+### How does the program run?
+
+```
+./pm_sim thread0.txt thread1.txt thread2.txt
+```
+
+- The program reads N script files from command-line arguments.
+- It creates N **worker threads**, one per file.
+- Each worker reads its file line by line and calls the appropriate function.
+- A separate **monitor thread** watches for any change to the process table and prints it.
+- All of this happens **concurrently** — threads are truly running at the same time.
 
 ---
 
-## 2. The Big Picture — How All Pieces Fit
+## 2. OS Concepts You Must Know
 
-When you run `./pm_sim thread0.txt thread1.txt`, this is what happens:
+### What is a Process?
 
-```
-main() starts
-  │
-  ├── Creates init process (PID=1) in the process table
-  │
-  ├── Spawns monitor thread ──────────────────────────────────┐
-  │     (sleeps until table changes, then prints)              │
-  │                                                            │
-  ├── Spawns worker thread 0 (reads thread0.txt)              │
-  │     fork 1  → calls pm_fork(1)                            │
-  │     sleep 200 → usleep(200000)                            │
-  │     wait 1 -1 → calls pm_wait(1, -1)  ← may BLOCK here   │
-  │                                                            │
-  ├── Spawns worker thread 1 (reads thread1.txt)              │
-  │     sleep 100 → usleep(100000)                            │
-  │     fork 1  → calls pm_fork(1)                            │
-  │     exit 2 10 → calls pm_exit(2, 10) ← WAKES worker 0    │
-  │                                                            │
-  └── Waits (pthread_join) for all workers to finish          │
-        │                                                      │
-        └── Sets simulation_done = true, wakes monitor ───────┘
-              monitor prints final state and exits
-```
+A process is a program in execution. It has:
+- Its own memory space
+- A unique ID (PID — Process IDentifier)
+- A state (running, waiting, etc.)
+- A parent (the process that created it)
 
-Every time any worker calls pm_fork, pm_exit, pm_wait, or pm_kill, the table is modified and a snapshot is written to `snapshots.txt`. The monitor thread also wakes up and prints to the terminal.
+### What is a PCB?
 
----
+The Process Control Block is the data structure the OS uses to store all information about one process. Think of it as the "file" the OS keeps on every process.
 
-## 3. C Fundamentals You Must Know
+### What is fork()?
 
-These are the C concepts used heavily. If you understand these, you understand the code.
+In real Unix, `fork()` creates an exact copy of the calling process. The copy is called the **child**. The original is the **parent**. In our simulation, `pm_fork(parent_pid)` creates a new PCB entry whose parent is `parent_pid`.
 
-### 3.1 Structs — Bundling Data Together
+### What is a Zombie Process?
 
-A `struct` is a way to group related variables under one name. Think of it as a row in a spreadsheet.
+When a process calls `exit()`, it dies — but its PCB is **not immediately deleted**. It stays in the table as a **zombie** until its parent calls `wait()` to collect the exit status. Only then is it fully removed (reaped).
 
-```c
-typedef struct {
-    int pid;
-    int ppid;
-} PCB;
+Why? Because the parent might want to know *how* its child died (exit code 0 = success, non-zero = error). The zombie holds onto that exit code until the parent reads it.
 
-PCB p;       // declare one PCB
-p.pid = 5;   // access a field with dot notation
-```
+### What is wait()?
 
-`typedef` just means you don't have to write `struct PCB` every time — you can just write `PCB`.
+`wait()` is called by a parent to:
+1. Block until a child exits (if no child has exited yet)
+2. Collect the child's exit status
+3. Remove the zombie from the process table (reap it)
 
-### 3.2 Arrays — A Row of the Same Type
+### What is the init process?
 
-```c
-PCB process_table[64];    // 64 PCBs in a row in memory
-process_table[0].pid = 1; // access the first one
-```
-
-### 3.3 Pointers — An Address to a Variable
-
-```c
-PCB *p = &process_table[5];  // p points TO the 6th entry
-p->pid = 10;                 // arrow -> is dot notation through a pointer
-```
-
-`&` means "give me the address of". `*` means "go to this address". `->` means "access field through pointer".
-
-### 3.4 Enums — Named Integer Constants
-
-```c
-typedef enum { RUNNING, BLOCKED, ZOMBIE, TERMINATED } ProcessState;
-```
-
-This just assigns: RUNNING=0, BLOCKED=1, ZOMBIE=2, TERMINATED=3. It makes the code readable — you write `state == ZOMBIE` instead of `state == 2`.
-
-### 3.5 Boolean in C
-
-C has no built-in `true`/`false`. The `#include <stdbool.h>` header gives you `bool`, `true`, and `false`. Without it you'd write `int active` and use 0 and 1.
-
-### 3.6 Mutex — A Lock for Shared Data
-
-When multiple threads access the same data, you need a lock to prevent them from running over each other.
-
-```c
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-
-pthread_mutex_lock(&lock);    // LOCK — only one thread can hold this at a time
-// ... safely read/write shared data ...
-pthread_mutex_unlock(&lock);  // UNLOCK — let next thread in
-```
-
-If Thread A holds the lock, Thread B calling `pthread_mutex_lock` will BLOCK (sleep) until Thread A unlocks. This is how you prevent race conditions.
-
-### 3.7 Condition Variables — Sleep and Wake
-
-A mutex prevents concurrent access. A condition variable lets a thread *sleep* until a specific condition becomes true.
-
-```c
-pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-
-// THREAD A — wants to wait for something:
-pthread_mutex_lock(&lock);
-pthread_cond_wait(&cond, &lock);  // atomically: releases lock + sleeps
-// ... woken up, lock re-acquired automatically ...
-pthread_mutex_unlock(&lock);
-
-// THREAD B — signals that the condition changed:
-pthread_mutex_lock(&lock);
-// ... make the change ...
-pthread_cond_broadcast(&cond);    // wake ALL sleeping threads
-pthread_mutex_unlock(&lock);
-```
-
-`pthread_cond_wait` does THREE things atomically:
-1. Releases the mutex
-2. Puts the thread to sleep
-3. Re-acquires the mutex when it wakes up
-
-This is critical — if it didn't release the mutex before sleeping, no other thread could ever acquire it, and nothing would ever change.
-
-### 3.8 Thread Functions
-
-Every function you pass to `pthread_create` must have this exact signature:
-
-```c
-void *my_function(void *arg) {
-    // ...
-    return NULL;
-}
-```
-
-The `void *` return and parameter are C's way of saying "any type". You cast to/from your actual type inside.
+In Linux, PID 1 is the `init` process — it's the first process started by the kernel and is the ancestor of all other processes. In our simulation, we manually create PID 1 with PPID 0 (it has no parent) as the starting point.
 
 ---
 
-## 4. Section by Section — Every Line Explained
+## 3. Concurrency Primitives — Mutex & Semaphore
 
-### 4.1 #includes and #defines
+This is the most important section for your viva. Make sure you understand this deeply.
+
+### Why do we need synchronization?
+
+We have multiple threads all reading and writing the same `process_table` array at the same time. Without synchronization, this causes **race conditions** — two threads might try to assign the same PID, or one thread might read a half-written PCB entry.
+
+### Mutex (Mutual Exclusion Lock)
+
+A mutex is a lock. Only one thread can hold it at a time.
+
+```c
+pthread_mutex_lock(&table_mutex);
+// --- CRITICAL SECTION ---
+// Only ONE thread is here at a time.
+// All others are blocked, waiting for the lock.
+pthread_mutex_unlock(&table_mutex);
+```
+
+**Key rule:** Any time you access `process_table`, `next_pid`, or `simulation_done`, you must hold `table_mutex`.
+
+Think of a mutex like a **bathroom key** — only the person holding the key can enter. Everyone else waits outside.
+
+### Semaphore
+
+A semaphore is a counter with two operations:
+- `sem_post(s)` — increments the counter (signals that something is available)
+- `sem_wait(s)` — decrements the counter, or **blocks if counter is 0** (waits until something is available)
+
+A semaphore initialized to 0 is perfect for **signaling**: one thread sleeps with `sem_wait`, another wakes it up with `sem_post`.
+
+```
+Initial value: 0
+
+Thread A calls sem_wait()  → counter is 0, so Thread A BLOCKS
+Thread B calls sem_post()  → counter becomes 1, Thread A WAKES UP
+Thread A resumes           → counter goes back to 0
+```
+
+**Semaphore vs Mutex:**
+
+| Feature | Mutex | Semaphore |
+|---|---|---|
+| Values | Locked / Unlocked (binary) | Integer counter (0 to N) |
+| Owner | Only the locker can unlock | Anyone can post |
+| Use case | Protect a critical section | Signal between threads |
+| Our usage | Protect process_table | Wake up blocked threads |
+
+### We use TWO semaphores:
+
+**`sem_monitor` (global)**
+- Initialized to 0
+- Posted every time `write_snapshot` is called (i.e., every table change)
+- The monitor thread does `sem_wait(&sem_monitor)` — it sleeps until there's a snapshot to print
+
+**`sem_wait` (per-PCB)**
+- Each PCB has its own semaphore, initialized to 0
+- When a parent calls `pm_wait` and no zombie child is found yet, the parent does `sem_wait` on **its own PCB's semaphore**
+- When a child exits (`pm_exit` or `pm_kill`), it does `sem_post` on the **parent's semaphore** to wake it up
+
+This is the key insight: each process has its own private "doorbell" semaphore. Only its children ring that doorbell.
+
+---
+
+## 4. Header Files
 
 ```c
 #include <stdio.h>
 ```
-Gives you `printf`, `fprintf`, `fopen`, `fclose`, `fgets`, `fflush`. Anything related to printing or file I/O.
+Standard I/O: `printf`, `fprintf`, `fopen`, `fclose`, `fgets`, `fflush`.
 
 ```c
 #include <stdlib.h>
 ```
-Gives you `malloc`, `free`, `exit`. Used for dynamic memory allocation in `main()`.
+Standard library: memory allocation, `exit()`. Not heavily used here but standard to include.
 
 ```c
 #include <string.h>
 ```
-Gives you `strcmp`, `strncmp`, `memcpy`, `snprintf`. Used in the script interpreter to compare command strings.
+String functions: `strncmp` (used to detect the `ps` command), `snprintf`.
 
 ```c
 #include <unistd.h>
 ```
-Gives you `usleep`. Used to implement the `sleep` command in scripts. `usleep` takes *microseconds*, so `usleep(200 * 1000)` sleeps 200 milliseconds.
+POSIX API: gives us `usleep()` — sleep for microseconds (used for the `sleep` script command).
 
 ```c
 #include <pthread.h>
 ```
-The POSIX threads library. Gives you everything with the `pthread_` prefix: `pthread_create`, `pthread_join`, `pthread_mutex_lock`, `pthread_cond_wait`, etc. This is the core library for the whole project.
+The POSIX threads library. Gives us:
+- `pthread_t` — thread handle type
+- `pthread_create` — create a thread
+- `pthread_join` — wait for a thread to finish
+- `pthread_mutex_t` — mutex type
+- `pthread_mutex_lock` / `pthread_mutex_unlock`
+
+```c
+#include <semaphore.h>
+```
+POSIX semaphores. Gives us:
+- `sem_t` — semaphore type
+- `sem_init` — initialize a semaphore
+- `sem_wait` — decrement (block if 0)
+- `sem_post` — increment (wake a waiter)
+- `sem_destroy` — clean up when done
 
 ```c
 #include <stdbool.h>
 ```
-Gives you `bool`, `true`, `false`. Without this, you'd write `int active` and check `if (active == 1)`.
+Gives us the `bool` type and `true` / `false` constants. Without this, we'd have to use `int` with 0/1.
+
+---
+
+## 5. Global Constants and Data
 
 ```c
 #define MAX_PROCESSES 64
 ```
-A preprocessor constant. Before compilation, every occurrence of `MAX_PROCESSES` in the code is literally replaced with `64`. It is NOT a variable — it has no memory address and cannot change at runtime. Using a define instead of the number `64` directly means if you ever need to change it, you change one line instead of hunting through the file.
-
----
-
-### 4.2 The ProcessState Enum
-
-```c
-typedef enum {
-    RUNNING,
-    BLOCKED,
-    ZOMBIE,
-    TERMINATED
-} ProcessState;
-```
-
-This defines the four legal states a process can be in. Under the hood, C assigns integers: RUNNING=0, BLOCKED=1, ZOMBIE=2, TERMINATED=3. But you never use those numbers — you always write the names.
-
-```c
-const char *state_to_str(ProcessState s) {
-    switch (s) {
-        case RUNNING:    return "RUNNING";
-        case BLOCKED:    return "BLOCKED";
-        case ZOMBIE:     return "ZOMBIE";
-        case TERMINATED: return "TERMINATED";
-        default:         return "UNKNOWN";
-    }
-}
-```
-
-This is a utility function. Given a `ProcessState` value, it returns the human-readable string version. Used when printing the process table. The `const char *` return type means "a pointer to a string that you should not modify".
-
-**Why `switch` instead of `if-else`?** Both work. `switch` is idiomatic for enum values — it is cleaner and the compiler can warn you if you forget a case.
-
----
-
-### 4.3 The PCB Struct
-
-```c
-typedef struct {
-    int pid, ppid;
-    ProcessState state;
-    int exit_status;
-    bool active;
-    int children[MAX_PROCESSES];
-    int child_count;
-} PCB;
-```
-
-This is the most important data structure. Each entry in the process table is one of these.
-
-- **`pid`** — Process ID. A unique integer assigned at creation. Starts at 1 for the init process, then 2, 3, 4... incremented by `next_pid++`.
-- **`ppid`** — Parent Process ID. The PID of whoever created this process. The init process has PPID=0 (no parent).
-- **`state`** — Current state from the enum above. Controls what operations are valid on this process.
-- **`exit_status`** — The integer passed to `pm_exit`. Meaningless until the process is in ZOMBIE state.
-- **`active`** — A boolean flag meaning "is this slot in the array currently in use?" This is needed because we never move entries in the array — a TERMINATED process just has `active = false`, freeing the slot for reuse.
-- **`children[MAX_PROCESSES]`** — An array storing the PIDs of this process's children. Required by the spec.
-- **`child_count`** — How many entries in `children[]` are valid. The children array can hold up to 64 entries; `child_count` tells you how many are actually used.
-
-**Why `active` instead of checking `state != TERMINATED`?**
-When we reap a process in `pm_wait`, we set both `state = TERMINATED` and `active = false`. The `active` flag is the authoritative "this slot is free" marker. It simplifies `find_free_slot()` and `find_by_pid()`.
-
----
-
-### 4.4 Global Variables
+The process table can hold at most 64 entries. This is a **compile-time constant** — it's replaced by the number 64 everywhere in code before compilation.
 
 ```c
 PCB process_table[MAX_PROCESSES];
+```
+The **shared process table**. An array of 64 PCB structs sitting in global memory. Every thread reads and writes this. This is why we need a mutex.
+
+```c
 int next_pid = 1;
 ```
-
-`process_table` is the array of 64 PCBs. This is the shared data structure — every thread reads and writes it. `next_pid` is the counter for assigning new PIDs. Every `pm_fork` does `pid = next_pid++` to get the next available PID.
+The next PID to assign. Every time a new process is created, we take this value and increment it. Protected by the mutex so two threads don't get the same PID.
 
 ```c
 pthread_mutex_t table_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  table_cond  = PTHREAD_COND_INITIALIZER;
 ```
+The one global mutex protecting all access to `process_table` and `next_pid`. `PTHREAD_MUTEX_INITIALIZER` is a macro that statically initializes the mutex — no need to call `pthread_mutex_init()` for global mutexes.
 
-`table_mutex` is the single lock protecting the entire process table. Only one thread can hold it at a time. `PTHREAD_MUTEX_INITIALIZER` is a static initializer macro — it sets up the mutex without needing a separate `pthread_mutex_init()` call.
-
-`table_cond` is a single condition variable used for two purposes:
-1. Waking a parent blocked in `pm_wait` when its child exits
-2. Waking the monitor thread when anything in the table changes
-
-Both purposes use the same condition variable because both are triggered by the same event: a modification to the process table.
+```c
+sem_t sem_monitor;
+```
+The semaphore for the monitor thread. Declared globally so all functions can post to it via `write_snapshot`.
 
 ```c
 bool simulation_done = false;
+```
+A flag set by `main` when all worker threads have finished. The monitor thread checks this to know when to exit. Protected by `table_mutex`.
+
+```c
 FILE *snap_file = NULL;
 ```
-
-`simulation_done` is a flag set by `main()` after all worker threads finish. The monitor thread checks this to know when to exit. `snap_file` is the file handle for `snapshots.txt`, opened in `main()` and used by `write_snapshot()`.
-
-**Why are these global?**
-In C, the common pattern for shared state is global variables. The alternative is passing pointers everywhere. For a single-file project like this, globals are clean and appropriate.
+File pointer for `snapshots.txt`. Opened in `main`, written by `write_snapshot`.
 
 ---
 
-### 4.5 Helper Functions
-
-#### find_free_slot()
+## 6. The PCB Struct
 
 ```c
-int find_free_slot() {
+typedef struct {
+    int pid;           // This process's unique ID
+    int ppid;          // Parent's PID
+    ProcessState state; // Current state (RUNNING, BLOCKED, ZOMBIE, TERMINATED)
+    int exit_status;   // Exit code (only meaningful when ZOMBIE)
+    bool active;       // Is this slot in use?
+
+    int children[MAX_PROCESSES]; // Array of child PIDs
+    int child_count;             // How many children
+
+    sem_t sem_wait;    // Per-process semaphore for blocking in pm_wait
+} PCB;
+```
+
+### Why `active` instead of just checking state?
+
+When a PCB is `TERMINATED`, we set `active = false` to mark the slot as free for reuse. The `active` flag is the "is this slot occupied?" check. State alone wouldn't be enough because a slot could have garbage values from before it was ever used.
+
+### Why store `children[]`?
+
+We need to know which processes are children of a given parent — especially for `pm_wait(-1)` which waits for *any* child. The array stores PIDs of children.
+
+### Why `sem_wait` inside PCB?
+
+Each process gets its own semaphore specifically so `pm_wait` can block on it. This is a per-process resource:
+- Initialized to 0 in `pm_fork` when the process is created
+- Waited on in `pm_wait` when the parent has no zombie yet
+- Posted in `pm_exit`/`pm_kill` when a child exits
+- Destroyed in `pm_wait` when the zombie is reaped
+
+---
+
+## 7. Process States and Transitions
+
+```c
+typedef enum {
+    RUNNING,     // Process exists and is active
+    BLOCKED,     // Process is waiting for a child
+    ZOMBIE,      // Process has exited, not yet reaped
+    TERMINATED   // Process has been reaped (slot is freed)
+} ProcessState;
+```
+
+### State Transition Diagram
+
+```
+                   pm_fork()
+                       │
+                       ▼
+                   RUNNING  ◄────────────────────────────┐
+                  /        \                             │
+      pm_wait()  /          \ pm_exit() / pm_kill()     │
+    (no zombie) /            \                           │
+               ▼              ▼                          │
+           BLOCKED          ZOMBIE                       │
+               │               │                         │
+               │ child exits   │ parent calls pm_wait()  │
+               └───────────────┘                         │
+                       │                                 │
+                       ▼                                 │
+                  TERMINATED ─── slot freed, can be ─────┘
+                               reused by new pm_fork()
+```
+
+### Key Rule: TERMINATED processes are invisible
+
+`print_table` skips any PCB where `state == TERMINATED` or `active == false`. Once reaped, a process completely disappears from all output.
+
+---
+
+## 8. Helper Functions
+
+### `find_free_slot()`
+
+```c
+int find_free_slot(void) {
     for (int i = 0; i < MAX_PROCESSES; i++)
         if (!process_table[i].active) return i;
     return -1;
 }
 ```
 
-Scans the process table from index 0 to 63. Returns the first index where `active` is false. Returns -1 if the table is full (all 64 slots in use). Used by `pm_fork` before creating a new process.
+Scans the process table array from index 0 to 63 looking for any slot where `active == false`. Returns the index (not the PID!) of the first free slot, or -1 if the table is full.
 
-**Important:** This function must only be called while holding `table_mutex`. It reads `active` fields, which could be modified by another thread simultaneously. The comments in the code say "call only while holding table_mutex" — this is a contract between the function and its callers.
+Note: this returns an **array index**, not a PID. The PID is separately assigned from `next_pid`.
 
-#### find_by_pid()
+**Must be called while holding `table_mutex`** — otherwise two threads might find the same free slot simultaneously.
+
+### `find_by_pid()`
 
 ```c
 int find_by_pid(int pid) {
@@ -343,11 +363,13 @@ int find_by_pid(int pid) {
 }
 ```
 
-Scans the table for an active process with the given PID. Returns its array index, or -1 if not found. Used by almost every PM function to translate from "I want to operate on PID 5" to "PID 5 is at index 3 in the array".
+Scans the table looking for a PCB with a matching `pid` that is also `active`. Returns the array index or -1.
 
-Note it checks `active` first — TERMINATED (inactive) processes might still have their PID field set from when they were alive. We never want to accidentally operate on a dead slot.
+Why check `active`? Because a slot might have a leftover `pid` value from a previously terminated process. We only want currently active ones.
 
-#### print_table()
+**Must be called while holding `table_mutex`.**
+
+### `print_table()`
 
 ```c
 void print_table(FILE *out) {
@@ -358,7 +380,8 @@ void print_table(FILE *out) {
         PCB *p = &process_table[i];
         if (!p->active || p->state == TERMINATED) continue;
 
-        fprintf(out, "%d\t%d\t%s\t", p->pid, p->ppid, state_to_str(p->state));
+        fprintf(out, "%d\t%d\t%s\t",
+                p->pid, p->ppid, state_to_str(p->state));
 
         if (p->state == ZOMBIE)
             fprintf(out, "%d\n", p->exit_status);
@@ -369,45 +392,65 @@ void print_table(FILE *out) {
 }
 ```
 
-Prints the process table to any file (`FILE *out`). The `out` parameter means you can call this with `stdout` for terminal output or `snap_file` for file output — same function, different destination.
+Prints the process table to any file (`stdout` for console, `snap_file` for snapshots.txt).
 
-- `fprintf(out, ...)` is like `printf` but writes to `out` instead of the terminal
-- `PCB *p = &process_table[i]` — take the address of entry `i` and store it in pointer `p`. Now `p->pid` is cleaner than `process_table[i].pid` in each line
-- `if (!p->active || p->state == TERMINATED) continue;` — skip empty slots and reaped processes. The spec says TERMINATED processes should not appear
-- `\t` is a tab character — makes columns align nicely
-- Exit status is only printed for ZOMBIE processes. For all others, we print `-`
+Line by line:
+- Print the header row
+- Print the separator line
+- For each slot: skip if not active or if TERMINATED
+- Print PID, PPID, state as a string
+- For EXIT_STATUS: only print the number if the process is a ZOMBIE, otherwise print a hyphen `-`
+- Print a trailing newline for visual separation
 
-**Must be called while holding table_mutex**, since it reads the entire table.
+**Must be called while holding `table_mutex`.**
 
-#### write_snapshot()
+### `state_to_str()`
+
+```c
+const char *state_to_str(ProcessState s) {
+    switch (s) {
+        case RUNNING:    return "RUNNING";
+        ...
+    }
+}
+```
+
+Converts the enum value to a human-readable string for printing. Straightforward.
+
+---
+
+## 9. write_snapshot
 
 ```c
 void write_snapshot(const char *label) {
     fprintf(snap_file, "%s\n", label);
     print_table(snap_file);
     fflush(snap_file);
-    pthread_cond_broadcast(&table_cond);
+    sem_post(&sem_monitor);
 }
 ```
 
-Called by every PM operation after it modifies the table. Writes a labeled snapshot to `snapshots.txt`.
+This function is the central logging mechanism. It is **always called while `table_mutex` is already held** — that's a critical design rule.
 
-- `fprintf(snap_file, "%s\n", label)` — write the label line, e.g. "Thread 0 calls pm_fork 1"
-- `print_table(snap_file)` — write the current table state below it
-- `fflush(snap_file)` — force the OS to actually write buffered data to disk immediately. Without this, output might sit in a buffer and not appear in the file until the program exits
-- `pthread_cond_broadcast(&table_cond)` — wake ALL threads sleeping on `table_cond`. This wakes the monitor thread so it prints to the terminal
+Line by line:
+- `fprintf(snap_file, "%s\n", label)` — write the event label (e.g., "Thread 0 calls pm_fork 1") to snapshots.txt
+- `print_table(snap_file)` — write the current state of the entire process table below the label
+- `fflush(snap_file)` — force the OS to flush the buffer to disk immediately (so the file is always up to date even if the program crashes)
+- `sem_post(&sem_monitor)` — increment the monitor semaphore by 1, waking up the monitor thread
 
-**This function must be called while holding table_mutex**, since it reads the table via `print_table`.
+**Why call this inside the mutex?**
+
+Because we're reading `process_table` to print it. If we called this after releasing the mutex, another thread could modify the table between the unlock and the print, giving us an inconsistent snapshot.
 
 ---
 
-### 4.6 pm_fork
+## 10. pm_fork
 
 ```c
 int pm_fork(int parent_pid, int tid) {
     pthread_mutex_lock(&table_mutex);
 ```
-Acquire the lock before touching the shared table. No other thread can enter any PM function until we release it.
+First thing: acquire the lock. No other thread can touch the table while we work.
 
 ```c
     int parent_idx = find_by_pid(parent_pid);
@@ -416,7 +459,7 @@ Acquire the lock before touching the shared table. No other thread can enter any
         return -1;
     }
 ```
-Find the parent process. If the parent doesn't exist (invalid PID), release the lock and return an error. **Critical:** unlock before every return path, or you deadlock the entire program.
+Find the parent process. If it doesn't exist (invalid PID), release the lock and return error. We **must** unlock before returning — otherwise we leave the mutex locked forever (deadlock).
 
 ```c
     int slot = find_free_slot();
@@ -425,12 +468,12 @@ Find the parent process. If the parent doesn't exist (invalid PID), release the 
         return -1;
     }
 ```
-Find a free slot in the table. If all 64 slots are full, fail gracefully.
+Find a free slot in the table. If the table is full (64 processes), fail safely.
 
 ```c
     int pid = next_pid++;
 ```
-Assign the next available PID. The `++` is post-increment — `pid` gets the current value of `next_pid`, then `next_pid` is incremented. Since this happens under the mutex, no two threads can get the same PID.
+Assign the next available PID. `next_pid++` reads the current value (assigns to `pid`) then increments `next_pid`. Because we hold the mutex, no other thread can do this simultaneously — so PIDs are unique.
 
 ```c
     PCB *child = &process_table[slot];
@@ -440,32 +483,41 @@ Assign the next available PID. The `++` is post-increment — `pid` gets the cur
     child->exit_status = 0;
     child->active      = true;
     child->child_count = 0;
+    sem_init(&child->sem_wait, 0, 0);
 ```
-Fill in the new PCB. The child starts in RUNNING state. We zero out `child_count` because this is a fresh process with no children of its own yet.
+Fill in the new PCB:
+- `pid` = newly assigned PID
+- `ppid` = the parent's PID
+- `state` = RUNNING (all newly created processes start running)
+- `exit_status` = 0 (not meaningful yet, just initialized)
+- `active` = true (slot is now occupied)
+- `child_count` = 0 (no children yet)
+- `sem_init(&child->sem_wait, 0, 0)` = initialize the per-process semaphore to 0 (the `0, 0` means: not shared across processes, initial value 0)
 
 ```c
     PCB *parent = &process_table[parent_idx];
     parent->children[parent->child_count++] = pid;
 ```
-Add the new child's PID to the parent's children list. `child_count++` post-increments: we store at index `child_count`, then increment it. So first child goes to index 0, second to index 1, etc.
+Register the new child with the parent. Add the new PID to the parent's `children[]` array and increment `child_count`.
 
 ```c
     char label[128];
-    snprintf(label, sizeof(label), "Thread %d calls pm_fork %d", tid, parent_pid);
+    snprintf(label, sizeof(label),
+             "Thread %d calls pm_fork %d", tid, parent_pid);
     write_snapshot(label);
 ```
-Build the snapshot label string and write the snapshot. `snprintf` is like `sprintf` but safer — the second argument `sizeof(label)` prevents writing past the end of the buffer.
+Build the snapshot label string and log the current state of the table.
 
 ```c
     pthread_mutex_unlock(&table_mutex);
     return pid;
 }
 ```
-Release the lock and return the new child's PID. The snapshot was taken while we still held the lock, so it accurately reflects the table state immediately after the fork.
+Release the lock and return the new child's PID.
 
 ---
 
-### 4.7 pm_exit
+## 11. pm_exit
 
 ```c
 void pm_exit(int pid, int status, int tid) {
@@ -473,31 +525,49 @@ void pm_exit(int pid, int status, int tid) {
 
     int idx = find_by_pid(pid);
     if (idx != -1 && process_table[idx].state != TERMINATED) {
+```
+Find the process. The guard `state != TERMINATED` prevents double-exiting a process that was already reaped.
+
+```c
         process_table[idx].state       = ZOMBIE;
         process_table[idx].exit_status = status;
 ```
-Find the process and change its state to ZOMBIE. We check `state != TERMINATED` because calling exit on an already-dead process should do nothing. The process is not removed here — it becomes a ZOMBIE and waits for its parent to call `pm_wait` and collect it (reap it).
+Change state to ZOMBIE and save the exit code. The process is "dead" but its PCB remains so the parent can read the exit code.
 
 ```c
         char label[128];
-        snprintf(label, sizeof(label), "Thread %d calls pm_exit %d %d", tid, pid, status);
+        snprintf(label, sizeof(label),
+                 "Thread %d calls pm_exit %d %d", tid, pid, status);
         write_snapshot(label);
-
-        pthread_cond_broadcast(&table_cond);
 ```
-Write the snapshot, then broadcast on the condition variable. **This broadcast is critical.** If the parent is currently sleeping inside `pm_wait` (blocked waiting for a child to exit), it will be woken up by this broadcast. Without this line, the parent sleeps forever — a deadlock.
-
-The broadcast also wakes the monitor thread, which will then print the updated table to the terminal.
+Log the snapshot. At this moment, if the parent is BLOCKED (waiting), that will be visible in the snapshot because we haven't woken it up yet.
 
 ```c
+        notify_parent(process_table[idx].ppid);
     }
+
     pthread_mutex_unlock(&table_mutex);
 }
 ```
+Call `notify_parent` to wake up the parent (if it's blocked), then release the lock.
+
+### notify_parent (helper)
+
+```c
+static void notify_parent(int ppid) {
+    int p_idx = find_by_pid(ppid);
+    if (p_idx != -1)
+        sem_post(&process_table[p_idx].sem_wait);
+}
+```
+
+Find the parent by PID and `sem_post` on its personal semaphore. If the parent was blocked in `sem_wait(&process_table[p_idx].sem_wait)`, it will now wake up.
+
+The `static` keyword means this function is only visible within this file — good practice for internal helpers.
 
 ---
 
-### 4.8 pm_kill
+## 12. pm_kill
 
 ```c
 void pm_kill(int pid, int tid) {
@@ -506,31 +576,26 @@ void pm_kill(int pid, int tid) {
     int idx = find_by_pid(pid);
     if (idx != -1 && process_table[idx].state != TERMINATED) {
         process_table[idx].state       = ZOMBIE;
-        process_table[idx].exit_status = -1;
-
-        char label[128];
-        snprintf(label, sizeof(label), "Thread %d calls pm_kill %d", tid, pid);
-        write_snapshot(label);
-
-        pthread_cond_broadcast(&table_cond);
+        process_table[idx].exit_status = -1;    // -1 = killed, not natural exit
+        ...
+        notify_parent(process_table[idx].ppid);
     }
 
     pthread_mutex_unlock(&table_mutex);
 }
 ```
 
-Structurally identical to `pm_exit`, with two differences:
-1. The exit status is always `-1` (a conventional indicator of abnormal termination)
-2. The snapshot label says "pm_kill" instead of "pm_exit"
+Almost identical to `pm_exit`, except:
+- We don't receive a status from the process — it's being killed externally
+- We use `-1` as the exit status to indicate it was killed (not a natural exit)
 
-**Why not just call `pm_exit` from inside `pm_kill`?**
-Because `pm_exit` tries to acquire `table_mutex`, but `pm_kill` already holds it. Trying to lock a mutex you already hold is a **deadlock** — the thread blocks waiting for itself to release the lock, which can never happen. So `pm_kill` reimplements the logic directly.
+From the parent's perspective, a killed child behaves exactly like one that exited — it becomes a ZOMBIE and the parent can reap it with `pm_wait`.
 
 ---
 
-### 4.9 pm_wait
+## 13. pm_wait
 
-This is the most complex function. Read it carefully.
+This is the most complex function. Read carefully.
 
 ```c
 int pm_wait(int parent_pid, int child_pid, int tid) {
@@ -538,7 +603,7 @@ int pm_wait(int parent_pid, int child_pid, int tid) {
 
     while (true) {
 ```
-The outer `while(true)` loop is the standard pattern for condition variable use. We loop because after waking from `pthread_cond_wait`, we must re-check the condition — the wakeup might be spurious (a false alarm that pthreads is allowed to generate), or another thread might have already reaped the zombie before we got to it.
+We use a `while(true)` loop because after waking up from a `sem_wait`, we need to **check again** — the zombie we woke up for might have already been reaped by another thread.
 
 ```c
         bool has_children = false;
@@ -550,33 +615,40 @@ The outer `while(true)` loop is the standard pattern for condition variable use.
 
             has_children = true;
 
-            if ((child_pid == -1 || p->pid == child_pid) && p->state == ZOMBIE) {
+            if ((child_pid == -1 || p->pid == child_pid) &&
+                p->state == ZOMBIE) {
                 zombie_idx = i;
                 break;
             }
         }
 ```
-Scan the table looking for two things:
-- **`has_children`**: does this parent have ANY active children? If not, there's nothing to wait for.
-- **`zombie_idx`**: is there a child that is already ZOMBIE and can be reaped?
-
-`child_pid == -1` means "any child" — this is the `wait 1 -1` case from the spec.
+Scan the table for:
+1. Any active process whose `ppid == parent_pid` — if found, `has_children = true`
+2. Among those children, find one that is a ZOMBIE AND matches the requested `child_pid` (or any child if `child_pid == -1`)
 
 ```c
         if (zombie_idx != -1) {
             int status = process_table[zombie_idx].exit_status;
+            sem_destroy(&process_table[zombie_idx].sem_wait);
             process_table[zombie_idx].state  = TERMINATED;
             process_table[zombie_idx].active = false;
 
             char label[128];
-            snprintf(label, sizeof(label), "Thread %d calls pm_wait %d %d", tid, parent_pid, child_pid);
+            snprintf(label, sizeof(label),
+                     "Thread %d calls pm_wait %d %d",
+                     tid, parent_pid, child_pid);
             write_snapshot(label);
 
             pthread_mutex_unlock(&table_mutex);
             return status;
         }
 ```
-Found a zombie child. Reap it: mark as TERMINATED, set active=false (freeing the slot), take the snapshot, unlock, and return the exit status. This is the "happy path" — the child was already dead when we checked.
+**Zombie found!** Reap it:
+- Save the exit status (we'll return it)
+- `sem_destroy` — clean up the zombie's semaphore (it no longer needs it)
+- Mark as TERMINATED and `active = false` (frees the slot)
+- Write snapshot showing the reaped state
+- Unlock and return the exit status
 
 ```c
         if (!has_children) {
@@ -584,31 +656,47 @@ Found a zombie child. Reap it: mark as TERMINATED, set active=false (freeing the
             return -1;
         }
 ```
-No children at all. Return immediately — there is nothing to wait for.
+If there are no children at all, there's nothing to wait for. Return -1 immediately.
 
 ```c
         int p_idx = find_by_pid(parent_pid);
-        if (p_idx != -1) process_table[p_idx].state = BLOCKED;
+        if (p_idx != -1) {
+            process_table[p_idx].state = BLOCKED;
 
-        pthread_cond_wait(&table_cond, &table_mutex);
+            char blabel[128];
+            snprintf(blabel, sizeof(blabel),
+                     "Thread %d calls pm_wait %d %d (blocking)",
+                     tid, parent_pid, child_pid);
+            write_snapshot(blabel);
+        }
+```
+No zombie found yet. Mark the parent as BLOCKED and **write a snapshot right now** (while still holding the mutex). This is critical — it means the snapshot file records the parent as BLOCKED before we actually sleep. When `pm_exit` runs next, its snapshot will also show the parent as BLOCKED.
 
-        if (p_idx != -1) process_table[p_idx].state = RUNNING;
+```c
+        pthread_mutex_unlock(&table_mutex);
+
+        if (p_idx != -1)
+            sem_wait(&process_table[p_idx].sem_wait);
+
+        pthread_mutex_lock(&table_mutex);
+
+        if (p_idx != -1)
+            process_table[p_idx].state = RUNNING;
     }
 }
 ```
-Children exist but none are zombies yet. We must sleep and wait.
+**The critical sequence:**
+1. Release the mutex — we MUST do this before `sem_wait`, otherwise no other thread can call `pm_exit` to wake us up (deadlock!)
+2. `sem_wait` on our own semaphore — we sleep here until someone does `sem_post`
+3. When we wake up, re-acquire the mutex
+4. Set state back to RUNNING
+5. Loop back to the top of `while(true)` to re-check for zombies
 
-1. Set parent's state to BLOCKED in the table (so `pm_ps` shows it correctly)
-2. Call `pthread_cond_wait` — this atomically releases `table_mutex` and puts this thread to sleep
-3. When we wake up (because `pm_exit` called `pthread_cond_broadcast`), `pthread_cond_wait` re-acquires the mutex before returning
-4. Set parent back to RUNNING
-5. Loop back to the top of `while(true)` and re-check — is there a zombie now?
-
-**Why must this be a loop?** Because `pthread_cond_broadcast` wakes ALL sleeping threads. If two parents are waiting for the same child, both wake up, but only one gets to reap the zombie. The other must go back to sleep.
+**Why release the mutex before sem_wait?** If we kept the mutex locked and called `sem_wait`, we'd be sleeping while holding the lock. Nobody else could enter any function that needs the lock — including `pm_exit`. That's a **deadlock**: the parent is waiting for the child to exit, but the child can't exit because the parent holds the lock.
 
 ---
 
-### 4.10 pm_ps
+## 14. pm_ps
 
 ```c
 void pm_ps(int tid) {
@@ -619,66 +707,81 @@ void pm_ps(int tid) {
 }
 ```
 
-The simplest PM function. Lock, print to stdout (terminal), unlock. It does NOT write to snapshots.txt — it is a read-only operation and the spec only requires snapshots for modifications.
+Simple: lock, print the table to stdout (console), unlock. No snapshot written here — `ps` just shows the current state to the console, it doesn't log to the file.
 
 ---
 
-### 4.11 The Monitor Thread
+## 15. monitor_thread
 
 ```c
 void *monitor_thread(void *arg) {
     (void)arg;
-    pthread_mutex_lock(&table_mutex);
+```
+`(void)arg` suppresses the compiler warning for unused parameter. Monitor doesn't need any arguments.
 
+```c
     while (true) {
-        pthread_cond_wait(&table_cond, &table_mutex);
+        sem_wait(&sem_monitor);
+```
+Sleep here. This thread does nothing until `write_snapshot` calls `sem_post(&sem_monitor)`. Every time a snapshot is written anywhere in the code, the monitor wakes up.
+
+```c
+        pthread_mutex_lock(&table_mutex);
+        bool done = simulation_done;
         printf("[Monitor] Update:\n");
         print_table(stdout);
-        if (simulation_done) break;
+        pthread_mutex_unlock(&table_mutex);
+```
+Wake up, acquire the lock to safely read the table:
+- Read `simulation_done` flag (must read under mutex to avoid race)
+- Print "[Monitor] Update:" to console
+- Print the current table state
+- Release the lock
+
+```c
+        if (done) break;
     }
 
-    pthread_mutex_unlock(&table_mutex);
     return NULL;
 }
 ```
+If `simulation_done` was true when we woke up, break out of the loop and exit. The thread returns `NULL` (standard for pthreads).
 
-The monitor thread's job: sleep until the table changes, print it, repeat.
+**Why check `done` AFTER printing?**
 
-- `(void)arg;` — suppresses the compiler warning "unused parameter". The function signature requires `void *arg` but we don't use it.
-- The thread acquires `table_mutex` at the start and holds it for its entire life — but it gives it up every time it calls `pthread_cond_wait`.
-- Each time `write_snapshot()` (inside a PM function) calls `pthread_cond_broadcast`, the monitor wakes up, prints the current table to stdout, then checks if the simulation is over.
-- The check `if (simulation_done) break` comes **after** printing, not before. This ensures the monitor always prints the state that triggered the wakeup, even the final one.
+If we checked before printing, we'd exit without printing the final state. By printing first, then checking, we ensure the very last snapshot is always shown.
 
-**Why does the monitor hold the mutex while sleeping?**
-`pthread_cond_wait` requires you to hold the mutex when you call it. It atomically releases the mutex while sleeping. So even though it "holds" the mutex, other threads can still operate — they just take turns.
+**Why is `simulation_done` read under the mutex?**
+
+Because `main` writes to it: `simulation_done = true`. If we read it without the mutex, there's a race condition — the CPU might see a stale cached value of `false` even after `main` set it to `true`. The mutex enforces memory visibility.
 
 ---
 
-### 4.12 The Script Interpreter
+## 16. run_script
 
 ```c
 void run_script(const char *file, int tid) {
     FILE *f = fopen(file, "r");
-    if (!f) return;
+    if (!f) {
+        perror("fopen (script file)");
+        return;
+    }
+```
+Open the script file for reading. `perror` prints the system error message if it fails (e.g., "No such file or directory").
 
+```c
     char line[256];
     int a, b;
 
     while (fgets(line, sizeof(line), f)) {
 ```
-
-- `fopen(file, "r")` — open the file for reading. Returns NULL on failure.
-- `fgets(line, sizeof(line), f)` — read one line at a time into `line`. Returns NULL when EOF is reached, ending the loop.
-- `sizeof(line)` is 256 — this prevents buffer overflow. `fgets` will never write more than 256 characters.
+Read the file line by line. `fgets` reads one line at a time (up to 255 characters + null terminator). Returns NULL at end of file, ending the loop.
 
 ```c
         if (sscanf(line, "fork %d", &a) == 1)
             pm_fork(a, tid);
 ```
-
-`sscanf` is like `scanf` but reads from a string instead of stdin. It tries to match the format string `"fork %d"` against `line`. If it matches and successfully reads one integer into `a`, it returns 1. The `== 1` check verifies the parse succeeded.
-
-For `fork 1`, this extracts `a = 1` (the parent PID) and calls `pm_fork(1, tid)`.
+`sscanf` tries to parse the line as `"fork %d"` (the word "fork" followed by an integer). If it successfully parses 1 integer, it calls `pm_fork`.
 
 ```c
         else if (sscanf(line, "exit %d %d", &a, &b) == 2)
@@ -693,24 +796,21 @@ For `fork 1`, this extracts `a = 1` (the parent PID) and calls `pm_fork(1, tid)`
         else if (sscanf(line, "sleep %d", &a) == 1)
             usleep(a * 1000);
 ```
-
-Same pattern for each command. `sleep` is handled specially — it calls `usleep` (microseconds), so we multiply milliseconds by 1000. This sleep is just the worker thread waiting — it does NOT affect the process table.
+`sleep N` in the script means sleep N **milliseconds**. `usleep` takes **microseconds**. So we multiply by 1000: `N ms × 1000 = N×1000 µs`.
 
 ```c
         else if (strncmp(line, "ps", 2) == 0)
             pm_ps(tid);
     }
+
     fclose(f);
 }
 ```
-
-`strncmp(line, "ps", 2)` checks if the first 2 characters of `line` are "ps". This is safer than `strcmp(line, "ps\n")` because it works regardless of whether the line ends in `\n`, `\r\n`, or nothing.
-
-`fclose(f)` closes the file. Every `fopen` must have a matching `fclose`.
+`strncmp(line, "ps", 2)` compares only the first 2 characters of `line` with `"ps"`. This handles the fact that `fgets` includes the newline character `\n` at the end of the line — a direct `strcmp(line, "ps")` would fail because the line is actually `"ps\n"`.
 
 ---
 
-### 4.13 The Worker Thread
+## 17. worker
 
 ```c
 typedef struct {
@@ -725,58 +825,59 @@ void *worker(void *arg) {
 }
 ```
 
-`pthread_create` can only pass one argument to a thread function: a `void *`. To pass multiple values (thread ID + filename), we bundle them in a struct.
+`pthread_create` can only pass a single `void *` to the thread function. To pass multiple arguments (thread ID + filename), we pack them into an `Args` struct, pass a pointer to it, and cast it back inside the thread.
 
-`Args *a = arg;` is a cast — we tell C "treat this `void *` as a pointer to an `Args` struct". This is valid because that's exactly what `main()` passed in.
-
-The thread just calls `run_script` with its assigned file and ID, then exits by returning NULL.
+The worker simply calls `run_script` with its file and thread ID, then exits.
 
 ---
 
-### 4.14 main()
+## 18. main
 
 ```c
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s thread0.txt ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s thread0.txt [thread1.txt ...]\n", argv[0]);
         return 1;
     }
 ```
-
-`argc` = argument count (including the program name). `argv[0]` = program name, `argv[1]` = first script file, etc. If no script files are given, print usage to `stderr` and exit.
+`argc` = number of arguments. `argv[0]` = program name. `argv[1]` onwards = script filenames. We need at least 1 script file.
 
 ```c
     snap_file = fopen("snapshots.txt", "w");
     if (!snap_file) { perror("fopen"); return 1; }
 ```
-Open `snapshots.txt` for writing. `"w"` mode creates the file if it doesn't exist, or truncates (empties) it if it does. `perror` prints a system error message if `fopen` fails.
+Open `snapshots.txt` for writing. The `"w"` mode creates it if it doesn't exist, or truncates it if it does.
+
+```c
+    sem_init(&sem_monitor, 0, 0);
+```
+Initialize the monitor semaphore: `0` = not shared between processes (just threads), `0` = initial value.
 
 ```c
     for (int i = 0; i < MAX_PROCESSES; i++)
         process_table[i].active = false;
 ```
-Initialize all slots as inactive. Global arrays in C are zero-initialized by default, but `bool active = false` is explicit and clear.
+Mark all 64 slots as empty. Without this, they contain garbage values from uninitialized memory.
 
 ```c
     process_table[0] = (PCB){1, 0, RUNNING, 0, true, {0}, 0};
+    sem_init(&process_table[0].sem_wait, 0, 0);
     next_pid = 2;
 ```
-Create the init process manually at index 0. PID=1, PPID=0 (no parent), RUNNING, exit_status=0, active=true, empty children list. `next_pid = 2` so the next forked process gets PID 2.
-
-The `(PCB){...}` syntax is a **compound literal** — it creates and initializes a struct inline.
+Create the init process (PID 1, PPID 0) manually. The `(PCB){...}` syntax is a **compound literal** — it initializes all fields at once. Then initialize its semaphore and set `next_pid` to 2 (since 1 is taken).
 
 ```c
     pthread_mutex_lock(&table_mutex);
     write_snapshot("Initial Process Table");
     pthread_mutex_unlock(&table_mutex);
 ```
-Take the initial snapshot before any threads start. We lock even here because `write_snapshot` reads the table (via `print_table`).
+Write the very first snapshot (before any threads run). We lock/unlock even though no threads exist yet — good habit, and `write_snapshot` expects the lock to be held.
 
 ```c
     pthread_t monitor;
     pthread_create(&monitor, NULL, monitor_thread, NULL);
 ```
-Start the monitor thread. `pthread_create` takes: pointer to thread ID, attributes (NULL = defaults), function to run, argument to pass (NULL here since monitor needs nothing).
+Create the monitor thread. Arguments: `NULL` attributes (default), `monitor_thread` function, `NULL` argument.
 
 ```c
     int n = argc - 1;
@@ -788,267 +889,326 @@ Start the monitor thread. `pthread_create` takes: pointer to thread ID, attribut
         pthread_create(&threads[i], NULL, worker, &args[i]);
     }
 ```
-Create one worker thread per script file. `argc - 1` because `argv[0]` is the program name. Each worker gets its index as `tid` and its corresponding filename. We pass `&args[i]` — the address of that worker's args struct.
-
-**Important:** `args` is declared before the loop, so it lives for the entire `main()` function. If we declared `Args a` inside the loop body, it would go out of scope before the thread could use it.
+Create N worker threads, one per script file. Thread 0 gets `argv[1]`, Thread 1 gets `argv[2]`, etc. We pass `&args[i]` — a pointer to each thread's own `Args` struct.
 
 ```c
     for (int i = 0; i < n; i++)
         pthread_join(threads[i], NULL);
 ```
-Wait for all worker threads to finish. `pthread_join` blocks until the specified thread exits. Without this, `main()` would continue to the shutdown code before workers finish.
+**Wait** for all worker threads to finish. `pthread_join` blocks until the specified thread exits. We don't move on until all workers are done.
 
 ```c
     pthread_mutex_lock(&table_mutex);
     simulation_done = true;
-    pthread_cond_broadcast(&table_cond);
     pthread_mutex_unlock(&table_mutex);
-
-    pthread_join(monitor, NULL);
+    sem_post(&sem_monitor);
 ```
-Signal the monitor to exit. We set `simulation_done = true` under the mutex, then broadcast to wake the monitor. The monitor will print one final time, see `simulation_done`, and break out of its loop. Then we join it to wait for it to fully exit.
+Set the done flag under the mutex (for memory visibility), then post the monitor semaphore one final time to wake it up so it can see `done == true` and exit.
 
 ```c
+    pthread_join(monitor, NULL);
+
+    sem_destroy(&sem_monitor);
     fclose(snap_file);
     return 0;
 }
 ```
-Close the file and exit cleanly.
+Wait for the monitor thread to exit cleanly. Then destroy the semaphore (release OS resources) and close the file.
 
 ---
 
-## 5. Synchronization — The Heart of the Project
+## 19. Why No pthread_cond_t?
 
-### Why synchronization is needed
+The project explicitly forbids `pthread_cond_t`. Here's the comparison so you can explain it clearly:
 
-Imagine two worker threads both call `pm_fork(1)` at the exact same time (no mutex):
+### What pthread_cond_t does
 
-| Thread 0 | Thread 1 |
-|----------|----------|
-| `slot = find_free_slot()` → returns 1 | |
-| | `slot = find_free_slot()` → also returns 1 (!) |
-| `next_pid++` → pid = 2 | |
-| fills slot 1 with PID=2 | |
-| | `next_pid++` → pid = 2 again (!) |
-| | overwrites slot 1 with PID=2 again |
-
-Result: two processes with the same PID, one slot used twice, corrupted table. This is a **race condition**.
-
-The mutex prevents this by ensuring only one thread runs inside any PM function at a time.
-
-### The mutex pattern — always lock/unlock in pairs
+A condition variable is used together with a mutex. The pattern is:
 
 ```c
+pthread_mutex_lock(&m);
+while (!condition)
+    pthread_cond_wait(&cv, &m);   // atomically releases m and sleeps
+// condition is now true
+pthread_mutex_unlock(&m);
+```
+
+`pthread_cond_wait` atomically releases the mutex and puts the thread to sleep. When another thread calls `pthread_cond_signal` or `pthread_cond_broadcast`, the sleeping thread wakes up, re-acquires the mutex, and continues.
+
+### The problem with cond_wait: spurious wakeups and broadcast noise
+
+`pthread_cond_broadcast` wakes up **every** thread waiting on that condition. In a system with many parents waiting for children, all of them would wake up when *any* child exits — only one would find its zombie, and the rest would go back to sleep. This is wasteful.
+
+### How semaphores solve this better
+
+With per-PCB semaphores, each parent waits on **its own** semaphore. Only its own children post to that semaphore. So when child PID 5 exits, only the parent of PID 5 wakes up. Nobody else is disturbed.
+
+This is a **cleaner, more targeted** signaling mechanism.
+
+### Replacement mapping
+
+| Original (cond_t) | Replacement (semaphore) |
+|---|---|
+| `pthread_cond_wait(&table_cond, &table_mutex)` in `pm_wait` | `sem_wait(&process_table[p_idx].sem_wait)` after releasing mutex |
+| `pthread_cond_broadcast(&table_cond)` in `pm_exit`/`pm_kill` | `sem_post(&process_table[parent_idx].sem_wait)` |
+| `pthread_cond_wait(&table_cond, &table_mutex)` in monitor | `sem_wait(&sem_monitor)` |
+| `pthread_cond_broadcast(&table_cond)` in `write_snapshot` | `sem_post(&sem_monitor)` |
+
+---
+
+## 20. Concurrency Scenarios — Walk-Throughs
+
+### Scenario 1: Normal fork and exit
+
+**Script thread0.txt:**
+```
+fork 1
+```
+**Script thread1.txt:**
+```
+exit 2 10
+```
+
+1. Thread 0 calls `pm_fork(1, 0)` — acquires mutex, creates PID 2, writes snapshot, releases mutex
+2. Thread 1 calls `pm_exit(2, 10, 1)` — acquires mutex, turns PID 2 to ZOMBIE, writes snapshot, releases mutex
+3. Both snapshots are in the file; monitor prints after each one
+
+### Scenario 2: Parent waits before child exits
+
+**thread0.txt:** `wait 1 -1`  
+**thread1.txt:** `sleep 100` then `exit 2 10`
+
+1. Thread 0 calls `pm_wait(1, -1, 0)` — acquires mutex, scans for zombies, finds none
+2. Sets PID 1 to BLOCKED, writes "(blocking)" snapshot, **releases mutex**, calls `sem_wait` on PID 1's semaphore — Thread 0 is now sleeping
+3. Thread 1 (after 100ms) calls `pm_exit(2, 10, 1)` — acquires mutex (now free!), turns PID 2 to ZOMBIE
+4. Writes snapshot (shows PID 1 as BLOCKED, PID 2 as ZOMBIE)
+5. Calls `notify_parent(1)` → `sem_post(&process_table[0].sem_wait)` — wakes Thread 0
+6. Thread 1 releases mutex
+7. Thread 0 wakes from `sem_wait`, re-acquires mutex, loops back, finds PID 2 as ZOMBIE, reaps it
+8. Writes final "pm_wait 1 -1" snapshot, releases mutex, returns 10
+
+This produces the exact output shown in your screenshot.
+
+### Scenario 3: Multiple threads forking simultaneously
+
+**thread0.txt:** `fork 1`  
+**thread1.txt:** `fork 1`
+
+Both threads try to call `pm_fork(1, ...)` at the same time.
+
+- Thread 0 acquires the mutex first → gets PID 2, releases mutex
+- Thread 1 acquires the mutex next → gets PID 3, releases mutex
+
+Because of the mutex, PIDs are always unique. Without the mutex, both could read `next_pid = 2` and both would try to create PID 2 — a race condition.
+
+---
+
+## 21. Viva Questions
+
+**Q: What is a PCB and what does it contain in your implementation?**
+
+A PCB (Process Control Block) is a struct that represents one simulated process. It contains the PID, parent PID (PPID), current state, exit status, a list of children PIDs, an `active` flag marking whether the slot is in use, and a per-process semaphore used for blocking in `pm_wait`.
+
+---
+
+**Q: What is a zombie process? How is it handled?**
+
+A zombie is a process that has exited but hasn't been reaped by its parent yet. It stays in the process table in ZOMBIE state, holding its exit code, until the parent calls `pm_wait`. When the parent reaps it, the zombie transitions to TERMINATED and its slot is freed.
+
+---
+
+**Q: What is the purpose of the mutex in this program?**
+
+The mutex (`table_mutex`) protects the shared process table from concurrent access. Since multiple threads can call any function simultaneously, without the mutex, two threads could read/write the same PCB entry at the same time, causing corruption. The mutex ensures only one thread is inside the critical section at any time.
+
+---
+
+**Q: Why do you use semaphores and not condition variables?**
+
+Semaphores give us targeted signaling. Each process has its own semaphore, so when a child exits, only its parent wakes up. With condition variables and `pthread_cond_broadcast`, all waiting threads would wake up on any child exit, causing unnecessary context switches. Semaphores also don't require holding the mutex during the wait, which is the more natural pattern here.
+
+---
+
+**Q: Why must you release the mutex before calling `sem_wait` in `pm_wait`?**
+
+If we kept the mutex locked while calling `sem_wait`, we'd be sleeping while holding the lock. No other thread could acquire the mutex, which means `pm_exit` could never run to post the semaphore. The parent would wait forever for the child to exit, and the child would wait forever for the mutex — this is a deadlock.
+
+---
+
+**Q: What happens if a parent calls `pm_wait` but the child already exited?**
+
+`pm_wait` first scans for an existing zombie. If it finds one immediately, it reaps it and returns without ever calling `sem_wait`. No blocking occurs. This is the "fast path."
+
+---
+
+**Q: What does `sem_init(&sem, 0, 0)` mean?**
+
+The three arguments are: pointer to semaphore, `pshared` flag (0 = shared between threads only, not across processes), and initial value (0 = the semaphore starts locked, any `sem_wait` will block until a `sem_post` is called).
+
+---
+
+**Q: What is `next_pid` and why is it protected by the mutex?**
+
+`next_pid` is a global counter that tracks the next available PID. It must be protected by the mutex because without it, two threads calling `pm_fork` simultaneously could both read the same value of `next_pid`, assign the same PID to two different processes, and then both increment it — resulting in a duplicate PID. The mutex ensures only one thread increments `next_pid` at a time.
+
+---
+
+**Q: What does the monitor thread do and how does it know when to exit?**
+
+The monitor thread waits on `sem_monitor`. Every time `write_snapshot` is called, it posts `sem_monitor`, waking the monitor. The monitor then locks the mutex, reads `simulation_done`, prints the table, and unlocks. If `simulation_done` is true, it exits. Main sets `simulation_done = true` after all worker threads finish, then posts `sem_monitor` one final time to wake the monitor for its last print-and-exit.
+
+---
+
+**Q: What is `fflush` and why is it called in `write_snapshot`?**
+
+`fflush` forces the OS to write any buffered data to the actual file on disk. Without it, writes might stay in an internal buffer in RAM and not appear in the file until later. In a concurrent simulation that could crash or terminate unexpectedly, `fflush` ensures all snapshots are always persisted.
+
+---
+
+**Q: Why do you use `strncmp` for the "ps" command instead of `strcmp`?**
+
+`fgets` includes the newline character `\n` at the end of each line. So the line read from the file is `"ps\n"`, not `"ps"`. `strcmp(line, "ps")` would fail. `strncmp(line, "ps", 2)` compares only the first 2 characters, ignoring the newline.
+
+---
+
+**Q: What is `PTHREAD_MUTEX_INITIALIZER`?**
+
+It's a macro that statically initializes a mutex with default attributes at compile time. It's equivalent to calling `pthread_mutex_init(&m, NULL)` but works for global/static mutexes without needing explicit initialization code in `main`.
+
+---
+
+**Q: What is `pthread_join` and why is it called?**
+
+`pthread_join(t, NULL)` blocks the calling thread until thread `t` finishes. Without it, `main` might reach `return 0` before worker threads finish, killing the entire process and all threads. We join all workers before setting `simulation_done`, ensuring all work is complete before we signal the monitor to exit.
+
+---
+
+**Q: What happens if `pm_fork` is called with an invalid parent PID?**
+
+`find_by_pid(parent_pid)` returns -1. The code checks for this, releases the mutex immediately, and returns -1 (error). The table is not modified.
+
+---
+
+**Q: Can two threads fork children under the same parent simultaneously? Is this safe?**
+
+Yes, it's safe because of the mutex. Thread A acquires the lock, completes the entire fork (including updating `parent->child_count`), and releases the lock. Then Thread B does the same. The parent's `children[]` array is updated atomically — no lost updates.
+
+---
+
+**Q: Why write the "(blocking)" snapshot before releasing the mutex?**
+
+Because we want the snapshot file to show the parent as BLOCKED before we sleep. If we released the mutex first, `pm_exit` might run in the tiny gap between "mutex released" and "snapshot written," producing a snapshot that shows the zombie but the parent still as RUNNING — which would be incorrect and not match the expected output.
+
+---
+
+## 22. Common Bugs and Why We Avoided Them
+
+### Bug 1: Deadlock in pm_wait
+
+**Wrong approach:** Lock the mutex, then call `sem_wait` without releasing it.
+
+```c
+// WRONG
 pthread_mutex_lock(&table_mutex);
-// ... modify shared data ...
-pthread_mutex_unlock(&table_mutex);
+process_table[p_idx].state = BLOCKED;
+sem_wait(&process_table[p_idx].sem_wait);  // sleeping while holding lock!
 ```
 
-Every code path must unlock. If there are multiple return points in a function, every one of them must unlock first. A function that returns while holding the lock will deadlock everything that tries to acquire it afterward.
+**Why it deadlocks:** `pm_exit` needs `table_mutex` to turn the child into a ZOMBIE. But `pm_wait` is holding it and sleeping. Neither can proceed.
 
-### The condition variable pattern
+**Fix:** Unlock before `sem_wait`, relock after.
 
-Used in `pm_wait` and `monitor_thread`. The pattern is always:
+---
+
+### Bug 2: Monitor exits before printing the last snapshot
+
+**Wrong approach:** Check `simulation_done` first, then break, then print.
 
 ```c
-pthread_mutex_lock(&mutex);
-while (!condition_is_true) {
-    pthread_cond_wait(&cond, &mutex);  // releases lock, sleeps, re-acquires
-}
-// condition is now true, do the work
-pthread_mutex_unlock(&mutex);
+// WRONG
+sem_wait(&sem_monitor);
+if (simulation_done) break;    // exit without printing!
+print_table(stdout);
 ```
 
-And on the signaling side:
+**Fix:** Print first, check `done` after:
 
 ```c
-pthread_mutex_lock(&mutex);
-// make the condition true
-pthread_cond_broadcast(&cond);  // wake sleeping threads
-pthread_mutex_unlock(&mutex);
-```
-
-**Why `while` instead of `if`?**
-After `pthread_cond_wait` returns, you do NOT know for certain that your condition is true. Possible reasons for waking up:
-1. Another thread called broadcast for a different reason
-2. The OS generated a spurious wakeup
-3. Another thread already consumed the thing you were waiting for
-
-The `while` loop handles all three cases by re-checking before proceeding.
-
-### The two uses of table_cond
-
-`table_cond` serves double duty:
-
-**Use 1:** Wake parent in `pm_wait`
-- `pm_exit` and `pm_kill` call `pthread_cond_broadcast` after setting a process to ZOMBIE
-- Any parent sleeping in `pm_wait` wakes up and re-checks for zombie children
-
-**Use 2:** Wake monitor thread
-- `write_snapshot` (called inside every PM function) calls `pthread_cond_broadcast`
-- The monitor thread wakes and prints the updated table
-
-Both uses are triggered by the same event (table modification), so one condition variable handles both correctly.
-
----
-
-## 6. Process Lifecycle — State Transitions
-
-```
-             pm_fork()
-  ─────────────────────────> RUNNING
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-            pm_wait() called        pm_exit() or pm_kill()
-            (no zombie child)               │
-                    │                       ▼
-                    ▼                     ZOMBIE
-                 BLOCKED                    │
-                    │                       │
-          child calls pm_exit()     parent calls pm_wait()
-                    │               (reaps the zombie)
-                    ▼                       │
-                RUNNING ◄──────────────────┘
-                                            │
-                                            ▼
-                                        TERMINATED
-                                      (active = false)
-                                    (not shown in pm_ps)
-```
-
-### Legal transitions:
-- `RUNNING → BLOCKED`: parent calls `pm_wait` but no zombie child exists yet
-- `BLOCKED → RUNNING`: child exits (pm_exit/pm_kill), parent is woken up
-- `RUNNING → ZOMBIE`: process calls pm_exit, or another process calls pm_kill on it
-- `ZOMBIE → TERMINATED`: parent calls pm_wait, finds the zombie, reaps it
-
-### Illegal / impossible transitions:
-- TERMINATED → anything: once terminated, a process is gone
-- ZOMBIE → RUNNING: a zombie cannot be revived
-- BLOCKED → ZOMBIE: a blocked process cannot exit directly (another thread would kill it, but in this simulation processes are just table entries, so it's technically possible via pm_kill — it would set the blocked process to ZOMBIE)
-
----
-
-## 7. Tracing a Full Execution Example
-
-Using the test files from the spec:
-
-**thread0.txt:** `fork 1` / `sleep 200` / `fork 1` / `wait 1 -1` / `ps`  
-**thread1.txt:** `sleep 100` / `fork 1` / `sleep 300` / `exit 2 10` / `ps`
-
-Timeline (approximate, based on sleep values):
-
-```
-t=0ms:   Both workers start
-         Worker 0: fork 1 → creates PID=2 (child of PID=1)
-         Snapshot: "Thread 0 calls pm_fork 1" [PID 1 RUNNING, PID 2 RUNNING]
-
-t=100ms: Worker 1: fork 1 → creates PID=3 (child of PID=1)
-         Snapshot: "Thread 1 calls pm_fork 1" [PID 1, 2, 3 all RUNNING]
-
-t=200ms: Worker 0: fork 1 → creates PID=4 (child of PID=1)
-         Snapshot: "Thread 0 calls pm_fork 1" [PID 1,2,3,4 all RUNNING]
-         Worker 0: wait 1 -1
-           → checks table: PID 2,3,4 all RUNNING (none zombie)
-           → sets PID 1 to BLOCKED
-           → calls pthread_cond_wait → SLEEPS
-
-t=400ms: Worker 1: exit 2 10
-           → sets PID 2 to ZOMBIE with exit_status=10
-           → Snapshot: "Thread 1 calls pm_exit 2 10"
-           → pthread_cond_broadcast → WAKES Worker 0 !
-         Worker 0 wakes from cond_wait:
-           → sets PID 1 back to RUNNING
-           → loops back, finds PID 2 is ZOMBIE
-           → reaps it: PID 2 TERMINATED, active=false
-           → Snapshot: "Thread 0 calls pm_wait 1 -1"
-           → returns exit_status=10
-
-t=400ms: Worker 1: ps → prints table to stdout
-         Worker 0: ps → prints table to stdout
-```
-
-Final snapshots.txt:
-```
-Initial Process Table       ← PID 1 only
-Thread 0 calls pm_fork 1    ← PID 1,2
-Thread 1 calls pm_fork 1    ← PID 1,2,3
-Thread 0 calls pm_fork 1    ← PID 1,2,3,4
-Thread 1 calls pm_exit 2 10 ← PID 1 BLOCKED, PID 2 ZOMBIE
-Thread 0 calls pm_wait 1 -1 ← PID 1 RUNNING (2 gone), PID 3,4
+sem_wait(&sem_monitor);
+// ...
+print_table(stdout);
+if (done) break;
 ```
 
 ---
 
-## 8. Common Viva Questions and Answers
+### Bug 3: Race condition on simulation_done
 
-**Q: What is a race condition and where would one occur in this project without synchronization?**
+**Wrong approach:** Read `simulation_done` without the mutex.
 
-A: A race condition occurs when two threads access shared data concurrently and the result depends on which one runs first. In this project, without the mutex, two threads calling `pm_fork` simultaneously could read the same `next_pid` value and assign the same PID to two different processes, or both find the same free slot and overwrite each other's PCB.
+```c
+// WRONG (in monitor thread)
+bool done = simulation_done;   // not under mutex!
+```
 
----
+**Why it's a bug:** The CPU might cache the old value. Without the mutex enforcing memory synchronization, the monitor might never see `done = true`.
 
-**Q: What is a mutex and why do you need it?**
-
-A: A mutex (mutual exclusion lock) ensures that only one thread can execute a critical section at a time. We use `table_mutex` to protect the process table. Any thread that wants to read or modify the table must acquire the lock first. If another thread holds it, the calling thread blocks until the lock is released. This prevents race conditions.
-
----
-
-**Q: What is a condition variable and how does pm_wait use it?**
-
-A: A condition variable allows a thread to sleep until a specific condition becomes true. In `pm_wait`, if a parent has no zombie children, it calls `pthread_cond_wait`, which atomically releases the mutex and puts the thread to sleep. When `pm_exit` sets a process to ZOMBIE, it calls `pthread_cond_broadcast`, which wakes all sleeping threads. The parent wakes up, re-acquires the mutex, and re-checks whether its child is now a zombie.
+**Fix:** Always read/write `simulation_done` under `table_mutex`.
 
 ---
 
-**Q: Why does pthread_cond_wait need to be inside a while loop?**
+### Bug 4: strcmp vs strncmp for "ps"
 
-A: Because the wakeup does not guarantee the condition is true. A `pthread_cond_broadcast` wakes ALL sleeping threads, but only one can reap a given zombie. The others must re-check and go back to sleep. Also, the POSIX standard permits spurious wakeups — the thread can wake up even without a broadcast. The while loop handles both cases by always re-checking the condition.
+**Wrong approach:**
+```c
+else if (strcmp(line, "ps") == 0)
+```
 
----
+`fgets` returns `"ps\n"`, so `strcmp` with `"ps"` fails. The `ps` command never executes.
 
-**Q: What is a deadlock? How could one occur in this code?**
-
-A: A deadlock is when two or more threads each hold a lock the other needs, and both wait forever. In this code, a deadlock would occur if a function tries to acquire `table_mutex` while already holding it. For example, if `pm_kill` called `pm_exit` (which also locks the mutex), `pm_kill` would lock, then `pm_exit` would try to lock again and block forever waiting for itself.
-
-We prevent this by having `pm_kill` implement the termination logic directly rather than calling `pm_exit`.
-
----
-
-**Q: Why is the zombie state needed? Why not just delete the process immediately on exit?**
-
-A: Because the parent might call `pm_wait` to collect the exit status. If we deleted the process immediately, the parent would have no way to retrieve the exit code. The zombie state is a "waiting room" — the process is dead but its PCB entry persists until the parent acknowledges the death by calling `pm_wait`. Only then is the slot freed.
+**Fix:** `strncmp(line, "ps", 2)` — compare only 2 characters.
 
 ---
 
-**Q: What does the monitor thread do and how does it avoid busy-waiting?**
+### Bug 5: Forgetting to sem_destroy
 
-A: The monitor thread logs process table updates to the terminal. It avoids busy-waiting (constantly checking in a loop) by sleeping on `table_cond` using `pthread_cond_wait`. It only wakes when another thread calls `pthread_cond_broadcast` inside `write_snapshot`, which happens every time a PM operation modifies the table. So the monitor does zero work between updates.
-
----
-
-**Q: What happens if a parent exits without waiting for its children?**
-
-A: In this simulation, the children remain in the table as active processes with their original PPID. They will never be reaped (no one will call `pm_wait` for them) and will stay in RUNNING or ZOMBIE state forever. In a real OS, these would become "orphan" processes adopted by the init process. Our simulator does not implement orphan adoption, but it is a valid extension.
+If you don't call `sem_destroy` on reaped PCBs, you leak OS semaphore resources. Over time in a long simulation, this could exhaust system limits. We call `sem_destroy(&process_table[zombie_idx].sem_wait)` inside `pm_wait` when reaping.
 
 ---
 
-**Q: Why does write_snapshot call pthread_cond_broadcast?**
+### Bug 6: Not unlocking before early return
 
-A: For two reasons. First, to wake the monitor thread so it prints the updated table to the terminal. Second, any parent sleeping in `pm_wait` might also wake up here, but since `write_snapshot` is called from inside pm_exit and pm_kill (which have their own broadcast), this is actually redundant for the wait case. The broadcast in write_snapshot is primarily for the monitor.
+```c
+// WRONG
+int pm_fork(int parent_pid, int tid) {
+    pthread_mutex_lock(&table_mutex);
+    int parent_idx = find_by_pid(parent_pid);
+    if (parent_idx == -1)
+        return -1;   // mutex still locked! Nobody else can run.
+```
+
+**Fix:** Always unlock before returning:
+```c
+    if (parent_idx == -1) {
+        pthread_mutex_unlock(&table_mutex);
+        return -1;
+    }
+```
 
 ---
 
-**Q: What is snprintf and why use it instead of sprintf?**
+### Bug 7: Using the same semaphore for all waiters (global sem instead of per-PCB)
 
-A: Both format a string into a buffer. `snprintf` takes an additional size argument and will never write more characters than that limit, preventing a buffer overflow. `sprintf` has no limit and can corrupt memory if the formatted string is longer than the buffer. `snprintf` is always preferred in safe code.
-
----
-
-**Q: Explain the void* pattern used in thread functions.**
-
-A: `pthread_create` requires all thread functions to have the signature `void *fn(void *arg)`. This is because pthreads is a C library that must work with any function, regardless of what arguments it takes. `void *` is C's "any pointer" type. To pass multiple arguments, we pack them into a struct, pass a pointer to the struct as `void *`, and inside the thread function we cast back: `Args *a = (Args *)arg`. The cast is valid because we know that's what was passed.
+If a global semaphore was used for all `pm_wait` callers, calling `sem_post` once would wake up only one random waiter — not necessarily the right parent. With per-PCB semaphores, `notify_parent` posts exactly the right parent's semaphore.
 
 ---
 
-*End of notes. Good luck with the viva — you know this code.*
+*End of Notes*
+
+---
+
+> **Compile command:** `gcc -o pm_sim pm_sim.c -lpthread`
+>
+> **Run example:** `./pm_sim thread0.txt thread1.txt`
+>
+> **Output files:** `snapshots.txt` (all table snapshots), stdout (monitor prints + ps output)
